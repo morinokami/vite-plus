@@ -1626,7 +1626,7 @@ When installing a package that provides a binary already owned by another packag
 
 ```bash
 $ vp install -g eslint-v9
-  Installing eslint-v9 globally...
+Installing eslint-v9 globally...
 
 error: Executable 'eslint' is already installed by eslint
 
@@ -1645,12 +1645,11 @@ The `--force` flag automatically uninstalls the conflicting package before insta
 
 ```bash
 $ vp install -g --force eslint-v9
-  Installing eslint-v9 globally...
-  Uninstalling eslint (conflicts with eslint-v9)...
-  Uninstalled eslint
-  Running npm install...
-  Installed eslint-v9 v9.0.0
-  Binaries: eslint
+Installing eslint-v9 globally...
+Uninstalling eslint (conflicts with eslint-v9)...
+Uninstalled eslint
+Installed eslint-v9 v9.0.0
+Binaries: eslint
 ```
 
 **Important**: `--force` completely removes the conflicting package (not just the binary). This ensures a clean state without orphaned files.
@@ -1667,14 +1666,14 @@ This allows recovery even if package metadata is corrupted or manually deleted.
 ```bash
 # Normal uninstall
 $ vp remove -g typescript
-  Uninstalling typescript...
-  Uninstalled typescript
+Uninstalling typescript...
+Uninstalled typescript
 
 # Recovery mode (if typescript.json is missing)
 $ vp remove -g typescript
-  Uninstalling typescript...
-  Note: Package metadata not found, scanning for orphaned binaries...
-  Uninstalled typescript
+Uninstalling typescript...
+note: Package metadata not found, scanning for orphaned binaries...
+Uninstalled typescript
 ```
 
 #### Deterministic Binary Resolution
@@ -1686,6 +1685,161 @@ Binary execution uses per-binary config for deterministic lookup:
 3. If not found, the binary is not installed (no fallback scanning)
 
 This eliminates the non-deterministic behavior of filesystem iteration order.
+
+### npm Global Install Guidance
+
+When the npm shim detects `npm install -g <packages>`, it runs real npm normally but uses `spawn+wait` (instead of `exec`) so it can run post-install checks. After npm completes successfully, it checks whether the installed binaries are reachable from `$PATH` and prints a hint if they aren't.
+
+#### Why This Is Needed
+
+```
+~/.vite-plus/
+├── bin/                          ← ON $PATH (only this dir)
+│   ├── node → ../current/bin/vp  (shim)
+│   ├── npm → ../current/bin/vp   (shim)
+│   └── npx → ../current/bin/vp   (shim)
+└── js_runtime/node/20.18.0/bin/  ← NOT on $PATH
+    ├── node
+    ├── npm
+    ├── npx
+    └── codex                     ← installed by `npm i -g`, but unreachable
+```
+
+Users instinctively run `npm install -g codex`, which installs into the managed Node's bin dir — not on `$PATH`. The binary is silently unreachable.
+
+#### Call Flow: `npm install -g codex` (with post-install hint)
+
+```
+User runs: npm install -g codex
+         │
+         ▼
+┌─────────────────────────┐
+│  ~/.vite-plus/bin/npm   │  (symlink to vp binary)
+│  argv[0] = "npm"        │
+└────────────┬────────────┘
+             │
+             ▼
+┌───────────────────────────────────────────────────────────┐
+│  dispatch("npm", ["install", "-g", "codex"])               │
+│  (crates/vite_global_cli/src/shim/dispatch.rs)             │
+│                                                             │
+│  1–5. vpx / recursion / bypass / shim / core checks        │
+│  6. resolve version    → 20.18.0                           │
+│  7. ensure installed   → ok                                │
+│  8. locate npm binary  → ~/.vite-plus/js_runtime/          │
+│                           node/20.18.0/bin/npm              │
+│  9. save original_path = $PATH                             │
+│  10. prepend node bin dir to PATH                          │
+│  11. set recursion marker                                  │
+│                                                             │
+│  ┌─── npm global install detection ─────────────────────┐  │
+│  │                                                       │  │
+│  │  parse_npm_global_install(args)                       │  │
+│  │    → detects "install" + "-g"                         │  │
+│  │    → extracts packages: ["codex"]                     │  │
+│  │    → returns Some(NpmGlobalInstall)                   │  │
+│  │                                                       │  │
+│  │  spawn_tool(npm_path, args)    ← NOT exec!            │  │
+│  │    → runs real npm install -g codex                   │  │
+│  │    → waits for completion, exit_code = 0              │  │
+│  │                                                       │  │
+│  │  check_npm_global_install_result(                     │  │
+│  │      pkgs, ver, orig_path, npm_path)                  │  │
+│  │                                                       │  │
+│  │    ┌─ Determine actual npm global prefix ───────────┐ │  │
+│  │    │  run `npm config get prefix` → e.g. /usr/local │ │  │
+│  │    │  npm_bin_dir = <prefix>/bin/                    │ │  │
+│  │    │  (fallback: node_dir if npm fails)             │ │  │
+│  │    └────────────────────────────────────────────────┘ │  │
+│  │                                                       │  │
+│  │    ┌─ Is npm_bin_dir in original_path? ─────────────┐ │  │
+│  │    │  YES → return (binaries on PATH)               │ │  │
+│  │    │  NO  → continue to per-binary check            │ │  │
+│  │    └────────────────────────────────────────────────┘ │  │
+│  │                                                       │  │
+│  │    → for each binary in package:                      │  │
+│  │        skip core shims (node/npm/npx/vp)              │  │
+│  │        if already exists in ~/.vite-plus/bin/:         │  │
+│  │          if BinConfig exists → managed_conflicts       │  │
+│  │          skip (don't overwrite)                        │  │
+│  │        check source exists in npm_bin_dir             │  │
+│  │        add to missing_bins list                       │  │
+│  │    → warn about managed conflicts                     │  │
+│  │    → interactive? prompt to create links              │  │
+│  │      non-interactive? create links directly           │  │
+│  │    → prints tip: use `vp install -g` instead          │  │
+│  │                                                       │  │
+│  │  return exit_code (0)                                 │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Conflict with `vp install -g` shims**: If a binary already exists in `~/.vite-plus/bin/` AND has a BinConfig file (`~/.vite-plus/bins/{name}.json`), it is managed by `vp install -g`. The shim warns the user instead of silently skipping:
+
+```
+'codex' is already managed by `vp install -g`. Run `vp uninstall -g` first to replace it.
+```
+
+**Interactive mode** (stdin is a TTY):
+
+```
+'codex' is not available on your PATH.
+Create a link in ~/.vite-plus/bin/ to make it available? [Y/n]
+```
+
+If the user confirms (Y or Enter):
+
+- Creates a symlink: `~/.vite-plus/bin/codex` → `~/.vite-plus/js_runtime/node/20.18.0/bin/codex`
+- Prints: `Linked 'codex' to ~/.vite-plus/bin/codex`
+
+Then always prints the tip:
+
+```
+tip: Use `vp install -g codex` for managed shims that persist across Node.js version changes.
+```
+
+**Non-interactive mode** (piped/CI):
+
+- Creates the symlink directly (no prompt)
+- Prints: `Linked 'codex' to ~/.vite-plus/bin/codex`
+- Prints the same tip
+
+#### Call Flow: Normal `npm install react` — unaffected
+
+```
+User runs: npm install react
+         │
+         ▼
+┌───────────────────────────────────────────────────┐
+│  dispatch("npm", ["install", "react"])              │
+│                                                     │
+│  ... version resolution, PATH setup ...             │
+│                                                     │
+│  parse_npm_global_install(args)                      │
+│    → no "-g" or "--global" flag                      │
+│    → returns None                                    │
+│                                                     │
+│  (falls through to normal exec_tool)                 │
+│    → exec_tool(npm_path, args)                       │
+│       └─ replaces process with real npm (Unix exec)  │
+└───────────────────────────────────────────────────┘
+```
+
+#### `npm uninstall -g` Link Cleanup
+
+When `npm uninstall -g` is detected, the shim uses `spawn_tool()` (like install) to retain control after npm finishes. Before running npm, it collects bin names from the package's `package.json` (which will be removed by npm). After a successful uninstall, it removes the corresponding symlinks from `~/.vite-plus/bin/`.
+
+**Link tracking via BinConfig**: When `npm install -g` creates links in `~/.vite-plus/bin/`, a `BinConfig` with `source: "npm"` is written to `~/.vite-plus/bins/{name}.json`. This distinguishes npm-created links from `vp install -g` managed shims (`source: "vp"`) and user-owned binaries (no BinConfig).
+
+**Safe uninstall cleanup**: `npm uninstall -g` only removes links that have a BinConfig with `source: "npm"` AND whose `package` field matches the package being uninstalled. This prevents removing links that were overwritten by a later install of a different package exposing the same bin name. User-owned binaries and `vp install -g` managed shims are never touched.
+
+**`--prefix` support**: When `--prefix <dir>` is passed to `npm install -g` or `npm uninstall -g`, the shim uses that prefix for package.json lookups and bin dir resolution instead of running `npm config get prefix`. Both absolute and relative paths are supported — relative paths (e.g., `./custom`, `../foo`) are resolved against the current working directory.
+
+**Windows local path support**: `resolve_package_name()` treats drive-letter paths (`C:\...`) as local paths.
+
+#### Design Decision: spawn vs exec
+
+On Unix, `exec_tool()` uses `exec()` which replaces the current process — no code runs after. For `npm install -g` and `npm uninstall -g` specifically, we use `spawn_tool()` (spawn + wait) to retain control after npm finishes, enabling the post-install hint and post-uninstall link cleanup. All other npm commands continue to use `exec_tool()` for zero overhead.
 
 ## Exec Command
 

@@ -13,6 +13,17 @@ use vite_path::AbsolutePathBuf;
 use super::config::get_vite_plus_home;
 use crate::error::Error;
 
+/// Source that installed a binary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BinSource {
+    /// Installed via `vp install -g` (managed shim)
+    #[default]
+    Vp,
+    /// Installed via `npm install -g` shim interception (direct symlink)
+    Npm,
+}
+
 /// Config for a single binary, stored at ~/.vite-plus/bins/{name}.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,12 +36,20 @@ pub struct BinConfig {
     pub version: String,
     /// Node.js version used
     pub node_version: String,
+    /// How this binary was installed
+    #[serde(default)]
+    pub source: BinSource,
 }
 
 impl BinConfig {
-    /// Create a new BinConfig.
+    /// Create a new BinConfig with `Vp` source (used by `vp install -g`).
     pub fn new(name: String, package: String, version: String, node_version: String) -> Self {
-        Self { name, package, version, node_version }
+        Self { name, package, version, node_version, source: BinSource::Vp }
+    }
+
+    /// Create a new BinConfig with `Npm` source (used by npm install -g interception).
+    pub fn new_npm(name: String, package: String, node_version: String) -> Self {
+        Self { name, package, version: String::new(), node_version, source: BinSource::Npm }
     }
 
     /// Get the bins directory path (~/.vite-plus/bins/).
@@ -41,6 +60,44 @@ impl BinConfig {
     /// Get the path to a binary's config file.
     pub fn path(bin_name: &str) -> Result<AbsolutePathBuf, Error> {
         Ok(Self::bins_dir()?.join(format!("{bin_name}.json")))
+    }
+
+    /// Load config for a binary (synchronous).
+    pub fn load_sync(bin_name: &str) -> Result<Option<Self>, Error> {
+        let path = Self::path(bin_name)?;
+        match std::fs::read_to_string(path.as_path()) {
+            Ok(content) => {
+                let config: Self = serde_json::from_str(&content).map_err(|e| {
+                    Error::ConfigError(format!("Failed to parse bin config: {e}").into())
+                })?;
+                Ok(Some(config))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Save config for a binary (synchronous).
+    pub fn save_sync(&self) -> Result<(), Error> {
+        let path = Self::path(&self.name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(self).map_err(|e| {
+            Error::ConfigError(format!("Failed to serialize bin config: {e}").into())
+        })?;
+        std::fs::write(path.as_path(), content)?;
+        Ok(())
+    }
+
+    /// Delete config for a binary (synchronous).
+    pub fn delete_sync(bin_name: &str) -> Result<(), Error> {
+        let path = Self::path(bin_name)?;
+        match std::fs::remove_file(path.as_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Load config for a binary.
@@ -226,5 +283,67 @@ mod tests {
 
         let loaded = BinConfig::load("nonexistent").await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn test_source_defaults_to_vp() {
+        let config = BinConfig::new(
+            "tsc".to_string(),
+            "typescript".to_string(),
+            "5.0.0".to_string(),
+            "20.18.0".to_string(),
+        );
+        assert_eq!(config.source, BinSource::Vp);
+    }
+
+    #[test]
+    fn test_new_npm_source() {
+        let config = BinConfig::new_npm(
+            "codex".to_string(),
+            "@openai/codex".to_string(),
+            "22.22.0".to_string(),
+        );
+        assert_eq!(config.source, BinSource::Npm);
+        assert_eq!(config.name, "codex");
+        assert_eq!(config.package, "@openai/codex");
+        assert!(config.version.is_empty());
+        assert_eq!(config.node_version, "22.22.0");
+    }
+
+    #[test]
+    fn test_source_backward_compat_deserialize() {
+        // Old BinConfig files without "source" field should default to "vp"
+        let json =
+            r#"{"name":"tsc","package":"typescript","version":"5.0.0","nodeVersion":"20.18.0"}"#;
+        let config: BinConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.source, BinSource::Vp);
+    }
+
+    #[test]
+    fn test_sync_save_load_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = vite_shared::EnvConfig::test_guard(
+            vite_shared::EnvConfig::for_test_with_home(temp_dir.path()),
+        );
+
+        let config = BinConfig::new_npm(
+            "codex".to_string(),
+            "@openai/codex".to_string(),
+            "22.22.0".to_string(),
+        );
+        config.save_sync().unwrap();
+
+        let loaded = BinConfig::load_sync("codex").unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.source, BinSource::Npm);
+        assert_eq!(loaded.package, "@openai/codex");
+
+        BinConfig::delete_sync("codex").unwrap();
+        let loaded = BinConfig::load_sync("codex").unwrap();
+        assert!(loaded.is_none());
+
+        // Delete again should not error
+        BinConfig::delete_sync("codex").unwrap();
     }
 }

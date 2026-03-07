@@ -80,8 +80,10 @@ export async function snapTest() {
 
   // Create a unique temporary directory for testing
   // On macOS, `tmpdir()` is a symlink. Resolve it so that we can replace the resolved cwd in outputs.
+  // Remove hyphens from UUID to avoid npm's @npmcli/redact treating the path as containing
+  // secrets (it matches UUID patterns like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
   const systemTmpDir = fs.realpathSync(tmpdir());
-  const tempTmpDir = `${systemTmpDir}/vite-plus-test-${randomUUID()}`;
+  const tempTmpDir = `${systemTmpDir}/vite-plus-test-${randomUUID().replaceAll('-', '')}`;
   fs.mkdirSync(tempTmpDir, { recursive: true });
 
   // Clean up stale .node-version and package.json in the system temp directory.
@@ -252,6 +254,8 @@ async function runTestCase(name: string, tempTmpDir: string, casesDir: string, b
     GIT_COMMITTER_NAME: 'Test',
     GIT_AUTHOR_EMAIL: 'vite-plus-test@test.com',
     GIT_COMMITTER_EMAIL: 'vite-plus-test@test.com',
+    // make sure npm install global packages to the temporary directory
+    NPM_CONFIG_PREFIX: path.join(tempTmpDir, 'npm-global-lib-for-snap-tests'),
 
     // A test case can override/unset environment variables above.
     // For example, VITE_PLUS_CLI_TEST/CI can be unset to test the real-world outputs.
@@ -262,17 +266,27 @@ async function runTestCase(name: string, tempTmpDir: string, casesDir: string, b
   // from leaking into snap tests (it passes through via the VITE_* pattern).
   delete env['VITE_PLUS_NODE_VERSION'];
 
+  // Unset VITE_PLUS_TOOL_RECURSION to prevent the shim recursion guard from
+  // leaking into snap tests. When `pnpm` runs the test via the `vp` shim, vp
+  // sets this marker before exec. Without clearing it, every npm/node command
+  // in the test would bypass the managed shim and fall through to the system binary.
+  delete env['VITE_PLUS_TOOL_RECURSION'];
+
   // Sometimes on Windows, the PATH variable is named 'Path'
   if ('Path' in env && !('PATH' in env)) {
     env['PATH'] = env['Path'];
     delete env['Path'];
   }
+  // The node shim prepends ~/.vite-plus/js_runtime/node/VERSION/bin/ to PATH,
+  // which leaks into this process. Strip internal vite-plus paths so the test
+  // environment simulates a clean user PATH (only the shim bin dir + system paths).
+  const vitePlusJsRuntime = path.join(env['VITE_PLUS_HOME'], 'js_runtime');
   env['PATH'] = [
     // Extend PATH to include the package's bin directory
     // --bin-dir overrides the default for cases like global CLI tests
     // where vp should resolve to the Rust binary instead of the Node.js script
     path.resolve(expandHome(binDir || 'bin')),
-    ...env['PATH'].split(path.delimiter),
+    ...env['PATH'].split(path.delimiter).filter((p) => !p.startsWith(vitePlusJsRuntime)),
   ].join(path.delimiter);
 
   const newSnap: string[] = [];
